@@ -6,48 +6,37 @@ on:
     types: [ created, edited ]
 
 jobs:
-  #
-  # Build
-  #
   build:
     strategy:
       matrix:
-        dist: [arch,alpine,blueprint]
+        dist: [ubuntu, winebuntu]
     runs-on: ubuntu-latest
     steps:
-      # Install required tools
       - name: Install tools
         run: |
           sudo env DEBIAN_FRONTEND=noninteractive apt install -y tar xz-utils coreutils
-      # Download source from repository
       - uses: actions/checkout@v4
-      # Build
       - name: Build
         run: |
           mkdir -p dist
           sudo ./deploy/flatimage.sh ${{ matrix.dist }}
           cp ./build/dist/* ./dist
-      # Upload
       - name: Upload flatimage
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: flatimage
+          name: flatimage-${{ matrix.dist }}
           path: dist
 
-  #
-  # Release
-  #
   release:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
-          name: flatimage
-          path: dist
+          path: dist-all
       - name: Upload to release
         uses: fnkr/github-action-ghr@v1
         env:
-          GHR_PATH: dist/
+          GHR_PATH: dist-all/
           GHR_REPLACE: true
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
