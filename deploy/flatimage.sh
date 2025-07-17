@@ -511,6 +511,157 @@ function _create_subsystem_arch()
   mv ./"arch.flatimage" dist/
 }
 
+function _create_subsystem_ubuntu() {
+  set -euo pipefail
+
+  local MODE="${1:-default}"  # can be "wine" or "default"
+
+  mkdir -p dist
+
+  _fetch_static
+
+  local dist="ubuntu"
+  local codename="jammy"
+  local rootfs="/tmp/$dist"
+
+  rm -rf "$rootfs"
+  mkdir -p "$rootfs"
+
+  apt-get update
+  apt-get install -y --no-install-recommends debootstrap
+
+  debootstrap --variant=minbase --include=ca-certificates,gnupg "$codename" "$rootfs" http://archive.ubuntu.com/ubuntu/
+
+  cat >> "$rootfs/etc/apt/sources.list" <<EOF
+deb http://archive.ubuntu.com/ubuntu jammy universe
+deb http://archive.ubuntu.com/ubuntu jammy-updates universe
+deb http://archive.ubuntu.com/ubuntu jammy multiverse
+deb http://archive.ubuntu.com/ubuntu jammy-updates multiverse
+EOF
+
+  chroot "$rootfs" apt-get update
+
+  # Minimal network + locale setup
+  echo "nameserver 8.8.8.8" > "$rootfs/etc/resolv.conf"
+  echo "127.0.0.1 localhost" > "$rootfs/etc/hosts"
+  echo "LANG=en_US.UTF-8" > "$rootfs/etc/locale.conf"
+  echo "en_US.UTF-8 UTF-8" >> "$rootfs/etc/locale.gen"
+  echo 'export LANG=en_US.UTF-8' >> "$rootfs/etc/profile"
+
+  # Service startup suppression
+  printf "#!/bin/sh\nexit 0\n" > "$rootfs/usr/sbin/policy-rc.d"
+  chmod +x "$rootfs/usr/sbin/policy-rc.d"
+
+  # APT sandbox config
+  cat > "$rootfs/etc/apt/apt.conf.d/99no-sandbox" <<EOF
+APT::Sandbox::User "root";
+DPkg::Pre-Invoke { "rm -rf /var/lib/apt/lists/* || true"; };
+EOF
+
+  # Create essential directories
+  mkdir -p "$rootfs"/{proc,sys,dev,run,media,mnt,home,tmp}
+
+  # Update + install packages
+  chroot "$rootfs" apt-get update
+  DEBIAN_FRONTEND=noninteractive chroot "$rootfs" apt-get install -y \
+    bash locales sudo curl netbase wget \
+    libasound2 libgl1-mesa-dri libglx-mesa0 \
+    libsdl2-2.0-0 \
+    libvulkan1 pulseaudio pipewire pipewire-media-session \
+    alsa-utils vulkan-tools binutils fakeroot
+
+  # Install wine and winetricks only if MODE is wine
+  if [[ "$MODE" == "wine" ]]; then
+    echo "Installing Wine inside chroot..."
+
+    # Prepare APT key and source list inside the chroot
+    mkdir -p "$rootfs/etc/apt/keyrings"
+    chroot "$rootfs" bash -c "
+      dpkg --add-architecture i386
+      apt-get update
+      apt-get install -y wget gnupg software-properties-common lsb-release cabextract
+
+      wget -O- https://dl.winehq.org/wine-builds/winehq.key | gpg --dearmor > /etc/apt/keyrings/winehq-archive.key
+      distro=\$(lsb_release -cs)
+      echo 'Types: deb
+URIs: https://dl.winehq.org/wine-builds/ubuntu
+Suites: '\$distro'
+Components: main
+Signed-By: /etc/apt/keyrings/winehq-archive.key' > /etc/apt/sources.list.d/winehq.sources
+
+      apt-get update
+      apt-get install -y --install-recommends winehq-stable winetricks cabextract
+    "
+  fi
+
+  # Generate locale
+  chroot "$rootfs" locale-gen en_US.UTF-8
+
+  # Clean systemd override (optional — safe to remove)
+  mkdir -p "$rootfs/etc/systemd/system/apt-helper.service.d"
+  echo -e "[Service]\nUser=root\nGroup=root" > "$rootfs/etc/systemd/system/apt-helper.service.d/override.conf"
+
+  # Avoid touching /etc/passwd or /etc/group — debootstrap sets them up
+
+  # Wipe unneeded locale/docs/man pages
+  rm -rf "$rootfs"/usr/share/{doc,man}/*
+  find "$rootfs/usr/share/locale" -mindepth 1 -maxdepth 1 -type d ! -name 'en' -exec rm -rf {} +
+
+  # Create internal app folders
+  mkdir -p "$rootfs/fim"/{config,static,desktop}
+  cp -r ./bin/* "$rootfs/fim/static"
+  cp "$FIM_DIR/mime/icon.svg" "$rootfs/fim/desktop"
+  cp "$FIM_DIR/mime/flatimage.xml" "$rootfs/fim/desktop"
+
+  # Build + copy internal tools
+  (
+    cd "$FIM_DIR"
+    docker build . --build-arg FIM_DIST=UBUNTU --build-arg FIM_DIR="$(pwd)" -t flatimage-boot -f docker/Dockerfile.boot
+    docker run --rm -v "$FIM_DIR_BUILD":/host flatimage-boot cp "$FIM_DIR/src/boot/build/Release/boot" /host/bin
+    docker run --rm -v "$FIM_DIR_BUILD":/host flatimage-boot cp "$FIM_DIR/src/boot/janitor" /host/bin
+  )
+
+  (
+    cd "$FIM_DIR"
+    docker build . -t flatimage-portal -f docker/Dockerfile.portal
+    docker run --rm -v "$FIM_DIR_BUILD":/host flatimage-portal cp /fim/dist/fim_portal /fim/dist/fim_portal_daemon /host/bin
+  )
+
+  (
+    cd "$FIM_DIR"
+    docker build . -t flatimage-bwrap-apparmor -f docker/Dockerfile.bwrap_apparmor
+    docker run --rm -v "$FIM_DIR_BUILD":/host flatimage-bwrap-apparmor cp /fim/dist/fim_bwrap_apparmor /host/bin
+  )
+
+  # Copy built tools to image
+  cp ./bin/{fim_portal,fim_portal_daemon,boot,janitor,fim_bwrap_apparmor} "$rootfs/fim/static"
+
+  # Final cleanup
+  rm -rf "$rootfs/var/cache/apt/archives"/*
+  rm -rf "$rootfs/var/lib/apt/lists"/*
+
+  # Only chown fim directory, not the whole rootfs
+  chown -R 1000:1000 "$rootfs/fim"
+
+  # Weird hack (not sure this works): ensure system files have correct ownership
+  for f in group passwd shadow; do
+    [ -f "$rootfs/etc/$f" ] && chown root:root "$rootfs/etc/$f"
+  done
+  chmod 644 "$rootfs/etc/group" "$rootfs/etc/passwd"
+  chmod 640 "$rootfs/etc/shadow"
+
+  # Create image
+  ./bin/mkdwarfs -i "$rootfs" -o "$dist.layer"
+  _create_elf "$dist.layer" "$dist.flatimage"
+  sha256sum "$dist.flatimage" > dist/"$dist.flatimage.sha256sum"
+  mv "$dist.flatimage" dist/
+}
+
+function _create_subsystem_wine_ubuntu(){
+  _create_subsystem_ubuntu "wine"
+}
+
+
 function main()
 {
   rm -rf "$FIM_DIR_BUILD"
@@ -521,7 +672,9 @@ function main()
     "arch") _create_subsystem_arch ;;
     "alpine") _create_subsystem_alpine ;;
     "blueprint") _create_subsystem_blueprint ;;
-    *) _die "Invalid option $2" ;;
+    "ubuntu") _create_subsystem_ubuntu ;;
+    "winebuntu") _create_subsystem_wine_ubuntu ;;
+    *) _die "Invalid option $1" ;;
   esac
 }
 
